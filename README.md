@@ -1,7 +1,8 @@
 # Swamp Archive
 
 `@dieter/archive` is a [Swamp](https://swamp-club.com) model for safely
-extracting local `.tar`, `.tar.gz`, `.tgz`, and `.zip` archives.
+extracting local `.tar`, `.tar.gz`, `.tgz`, and `.zip` archives. Tar extraction
+supports POSIX PAX path metadata, used by archives with long or non-ASCII names.
 
 It extracts all configured source archives into one new destination directory.
 The destination must not already exist. Extraction happens in a sibling staging

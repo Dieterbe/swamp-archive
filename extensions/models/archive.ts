@@ -88,6 +88,70 @@ interface ExtractionCounters {
   uncompressedBytes: number;
 }
 
+const PAX_HEADER_MAX_BYTES = 1024 * 1024;
+
+/** Read a small tar metadata entry without accepting an unbounded allocation. */
+async function readMetadataEntry(
+  readable: ReadableStream<Uint8Array> | undefined,
+  path: string,
+): Promise<string> {
+  if (!readable) {
+    throw new Error(`Archive metadata member ${path} has no content`);
+  }
+  const reader = readable.getReader();
+  const chunks: Uint8Array[] = [];
+  let size = 0;
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      size += value.length;
+      if (size > PAX_HEADER_MAX_BYTES) {
+        throw new Error(
+          `Archive metadata member ${path} exceeds ${PAX_HEADER_MAX_BYTES} bytes`,
+        );
+      }
+      chunks.push(value);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  const bytes = new Uint8Array(size);
+  let offset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, offset);
+    offset += chunk.length;
+  }
+  return new TextDecoder().decode(bytes);
+}
+
+/** Parse POSIX PAX records ("<length> <key>=<value>\\n"). */
+function parsePaxAttributes(
+  content: string,
+  memberPath: string,
+): Map<string, string> {
+  const attributes = new Map<string, string>();
+  let offset = 0;
+  while (offset < content.length) {
+    const space = content.indexOf(" ", offset);
+    if (space === -1) throw new Error(`Invalid PAX header in ${memberPath}`);
+    const length = Number.parseInt(content.slice(offset, space), 10);
+    if (!Number.isSafeInteger(length) || length <= space - offset + 1) {
+      throw new Error(`Invalid PAX record length in ${memberPath}`);
+    }
+    const end = offset + length;
+    if (end > content.length || content[end - 1] !== "\n") {
+      throw new Error(`Invalid PAX record boundary in ${memberPath}`);
+    }
+    const record = content.slice(space + 1, end - 1);
+    const equals = record.indexOf("=");
+    if (equals <= 0) throw new Error(`Invalid PAX record in ${memberPath}`);
+    attributes.set(record.slice(0, equals), record.slice(equals + 1));
+    offset = end;
+  }
+  return attributes;
+}
+
 function archiveFormat(path: string): ArchiveFormat {
   const lowerPath = path.toLowerCase();
   if (lowerPath.endsWith(".zip")) return "zip";
@@ -164,7 +228,21 @@ async function extractTarArchive(
   const archiveStream = compressed
     ? source.readable.pipeThrough(new DecompressionStream("gzip"))
     : source.readable;
+  let pendingPath: string | undefined;
   for await (const entry of archiveStream.pipeThrough(new UntarStream())) {
+    if (entry.header.typeflag === "x") {
+      const attributes = parsePaxAttributes(
+        await readMetadataEntry(entry.readable, entry.path),
+        entry.path,
+      );
+      pendingPath = attributes.get("path") ?? pendingPath;
+      continue;
+    }
+    if (entry.header.typeflag === "L") {
+      pendingPath = (await readMetadataEntry(entry.readable, entry.path))
+        .replace(/\0.*$/, "");
+      continue;
+    }
     const kind = entry.header.typeflag === "5"
       ? "directory"
       : entry.header.typeflag === "" || entry.header.typeflag === "0"
@@ -175,15 +253,17 @@ async function extractTarArchive(
         `Archive ${sourceArchive} contains unsupported type ${entry.header.typeflag} member ${entry.path}`,
       );
     }
-    recordMember(counters, entry.path, kind, entry.header.size);
-    const target = outputPath(destinationDirectory, entry.path);
+    const archivePath = pendingPath ?? entry.path;
+    pendingPath = undefined;
+    recordMember(counters, archivePath, kind, entry.header.size);
+    const target = outputPath(destinationDirectory, archivePath);
     if (kind === "directory") {
       await Deno.mkdir(target, { recursive: true, mode: 0o750 });
       continue;
     }
     if (!entry.readable) {
       throw new Error(
-        `Archive ${sourceArchive} has no content for ${entry.path}`,
+        `Archive ${sourceArchive} has no content for ${archivePath}`,
       );
     }
     await Deno.mkdir(dirname(target), { recursive: true, mode: 0o750 });
@@ -327,8 +407,16 @@ export async function extractArchives(
 /** Local archive extraction model. */
 export const model = {
   type: "@dieter/archive",
-  version: "2026.09.06.1",
+  version: "2026.09.06.2",
   globalArguments: GlobalArgsSchema,
+  upgrades: [
+    {
+      toVersion: "2026.09.06.2",
+      description:
+        "Support POSIX PAX tar metadata; global arguments are unchanged",
+      upgradeAttributes: (old: Record<string, unknown>) => old,
+    },
+  ],
   resources: {
     summary: {
       description: "Summary of a completed archive extraction",

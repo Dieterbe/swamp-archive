@@ -6,8 +6,15 @@ function assert(condition: unknown, message: string): asserts condition {
   if (!condition) throw new Error(message);
 }
 
-function assertEquals(actual: unknown, expected: unknown, message: string): void {
-  assert(JSON.stringify(actual) === JSON.stringify(expected), `${message}: ${actual} !== ${expected}`);
+function assertEquals(
+  actual: unknown,
+  expected: unknown,
+  message: string,
+): void {
+  assert(
+    JSON.stringify(actual) === JSON.stringify(expected),
+    `${message}: ${actual} !== ${expected}`,
+  );
 }
 
 function writeUint16(bytes: Uint8Array, offset: number, value: number): void {
@@ -71,10 +78,19 @@ function createStoredZip(path: string, content: string): Uint8Array {
   return result;
 }
 
-async function writeTarGz(path: string, filePath: string, content: string): Promise<void> {
+async function writeTarGz(
+  path: string,
+  filePath: string,
+  content: string,
+): Promise<void> {
   const bytes = new TextEncoder().encode(content);
   const inputs: TarStreamInput[] = [
-    { type: "file", path: filePath, size: bytes.length, readable: new Blob([bytes]).stream() },
+    {
+      type: "file",
+      path: filePath,
+      size: bytes.length,
+      readable: new Blob([bytes]).stream(),
+    },
   ];
   const destination = await Deno.create(path);
   await ReadableStream.from(inputs)
@@ -83,8 +99,83 @@ async function writeTarGz(path: string, filePath: string, content: string): Prom
     .pipeTo(destination.writable);
 }
 
+function writeTarText(
+  bytes: Uint8Array,
+  offset: number,
+  length: number,
+  value: string,
+): void {
+  bytes.set(new TextEncoder().encode(value).subarray(0, length), offset);
+}
+
+function tarHeader(path: string, typeflag: string, size: number): Uint8Array {
+  const header = new Uint8Array(512);
+  writeTarText(header, 0, 100, path);
+  writeTarText(header, 100, 8, "0000644\0");
+  writeTarText(header, 108, 8, "0000000\0");
+  writeTarText(header, 116, 8, "0000000\0");
+  writeTarText(header, 124, 12, `${size.toString(8).padStart(11, "0")}\0`);
+  writeTarText(header, 136, 12, "00000000000\0");
+  header.fill(0x20, 148, 156);
+  header[156] = typeflag.charCodeAt(0);
+  writeTarText(header, 257, 6, "ustar\0");
+  writeTarText(header, 263, 2, "00");
+  const checksum = header.reduce((sum, byte) => sum + byte, 0);
+  writeTarText(header, 148, 8, `${checksum.toString(8).padStart(6, "0")}\0 `);
+  return header;
+}
+
+function paxRecord(key: string, value: string): string {
+  let record = ` ${key}=${value}\n`;
+  while (true) {
+    const withLength = `${
+      new TextEncoder().encode(record).length + String(record.length).length
+    }${record}`;
+    if (
+      new TextEncoder().encode(withLength).length ===
+        Number.parseInt(withLength, 10)
+    ) return withLength;
+    record = ` ${key}=${value}\n`;
+  }
+}
+
+/** Create a minimal tar.gz fixture with a PAX path header before one file. */
+async function writePaxTarGz(
+  path: string,
+  filePath: string,
+  content: string,
+): Promise<void> {
+  const encoder = new TextEncoder();
+  const pax = encoder.encode(paxRecord("path", filePath));
+  const data = encoder.encode(content);
+  const pad = (size: number) => new Uint8Array((512 - (size % 512)) % 512);
+  const parts = [
+    tarHeader("PaxHeaders.X/metadata", "x", pax.length),
+    pax,
+    pad(pax.length),
+    tarHeader("truncated-name", "0", data.length),
+    data,
+    pad(data.length),
+    new Uint8Array(1024),
+  ];
+  const length = parts.reduce((total, part) => total + part.length, 0);
+  const tar = new Uint8Array(length);
+  let offset = 0;
+  for (const part of parts) {
+    tar.set(part, offset);
+    offset += part.length;
+  }
+  const destination = await Deno.create(path);
+  await new Blob([tar]).stream().pipeThrough(new CompressionStream("gzip"))
+    .pipeTo(destination.writable);
+}
+
 Deno.test("assertSafeArchivePath rejects traversal and absolute paths", () => {
-  assertEquals(assertSafeArchivePath("photos/one.jpg"), "photos/one.jpg", "safe path retained");
+  assertEquals(
+    assertSafeArchivePath("photos/one.jpg"),
+    "photos/one.jpg",
+    "safe path retained",
+  );
   for (const unsafePath of ["../one.jpg", "/one.jpg", "photos\\one.jpg", ""]) {
     let rejected = false;
     try {
@@ -109,7 +200,9 @@ Deno.test("extractArchives extracts a tar.gz archive into a new destination", as
     assertEquals(summary.fileCount, 1, "file count");
     assertEquals(summary.uncompressedBytes, 5, "uncompressed bytes");
     assertEquals(
-      await Deno.readTextFile(join(destination, "Takeout/Google Photos/photo.txt")),
+      await Deno.readTextFile(
+        join(destination, "Takeout/Google Photos/photo.txt"),
+      ),
       "Ghent",
       "extracted content",
     );
@@ -123,7 +216,10 @@ Deno.test("extractArchives extracts a ZIP archive without external commands", as
   try {
     const archive = join(directory, "photos.zip");
     const destination = join(directory, "extracted");
-    await Deno.writeFile(archive, createStoredZip("Takeout/photo.txt", "Limassol"));
+    await Deno.writeFile(
+      archive,
+      createStoredZip("Takeout/photo.txt", "Limassol"),
+    );
 
     const summary = await extractArchives([archive], destination);
 
@@ -132,6 +228,32 @@ Deno.test("extractArchives extracts a ZIP archive without external commands", as
       await Deno.readTextFile(join(destination, "Takeout/photo.txt")),
       "Limassol",
       "extracted content",
+    );
+  } finally {
+    await Deno.remove(directory, { recursive: true });
+  }
+});
+
+Deno.test("extractArchives applies PAX paths without materializing metadata headers", async () => {
+  const directory = await Deno.makeTempDir({ prefix: "swamp-archive-test-" });
+  try {
+    const archive = join(directory, "photos.tgz");
+    const destination = join(directory, "extracted");
+    await writePaxTarGz(
+      archive,
+      "Takeout/Google Photos/long photo name.txt",
+      "Giannitsa",
+    );
+
+    const summary = await extractArchives([archive], destination);
+
+    assertEquals(summary.fileCount, 1, "file count excludes PAX metadata");
+    assertEquals(
+      await Deno.readTextFile(
+        join(destination, "Takeout/Google Photos/long photo name.txt"),
+      ),
+      "Giannitsa",
+      "PAX path content",
     );
   } finally {
     await Deno.remove(directory, { recursive: true });
